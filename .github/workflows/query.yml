@@ -1,0 +1,108 @@
+name: Daily electricity query
+
+on:
+  schedule:
+    - cron: "0 20 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: electricity-query
+  cancel-in-progress: false
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Typst
+        uses: typst-community/setup-typst@v5
+        continue-on-error: true
+        with:
+          typst-version: 0.15.0
+          cache-dependency-path: daily-usage-chart.typ
+
+      - name: Build query program
+        run: cargo build --locked --release --bin scheduled-query
+
+      - name: Query, append CSV, and publish data branch
+        env:
+          ALERT_THRESHOLD: ${{ secrets.ALERT_THRESHOLD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SDU_AUTH: ${{ secrets.SDU_AUTH }}
+          SDU_BUILDING: ${{ secrets.SDU_BUILDING }}
+          SDU_ROOM: ${{ secrets.SDU_ROOM }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          data_dir="${RUNNER_TEMP}/query-data"
+          git init --initial-branch=query-data "${data_dir}"
+          git -C "${data_dir}" remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git -C "${data_dir}" fetch --depth=1 origin query-data; then
+            git -C "${data_dir}" checkout -B query-data FETCH_HEAD
+          fi
+
+          export HISTORY_CSV="${data_dir}/history.csv"
+          set +e
+          ./target/release/scheduled-query
+          query_status=$?
+          set -e
+
+          render_status=0
+          if [[ -f "${data_dir}/history.csv" ]] &&
+             [[ $(wc -l < "${data_dir}/history.csv") -ge 3 ]]; then
+            render_dir="${RUNNER_TEMP}/electricity-chart"
+            mkdir -p "${render_dir}"
+            cp daily-usage-chart.typ render-latest.typ "${render_dir}/"
+
+            head -n 1 "${data_dir}/history.csv" > "${render_dir}/history.csv"
+            tail -n +2 "${data_dir}/history.csv" |
+              tail -n 184 >> "${render_dir}/history.csv"
+
+            set +e
+            typst compile \
+              --root "${render_dir}" \
+              "${render_dir}/render-latest.typ" \
+              "${render_dir}/daily-usage.svg"
+            render_status=$?
+            set -e
+
+            if [[ "${render_status}" -eq 0 ]]; then
+              cp "${render_dir}/daily-usage.svg" "${data_dir}/daily-usage.svg"
+            fi
+          fi
+
+          if [[ -f "${data_dir}/history.csv" ]]; then
+            git -C "${data_dir}" config user.name "github-actions[bot]"
+            git -C "${data_dir}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git -C "${data_dir}" add history.csv
+            if [[ -f "${data_dir}/daily-usage.svg" ]]; then
+              git -C "${data_dir}" add daily-usage.svg
+            fi
+            if ! git -C "${data_dir}" diff --cached --quiet; then
+              git -C "${data_dir}" commit -m "data: update electricity history"
+              git -C "${data_dir}" push origin HEAD:query-data
+            fi
+          fi
+
+          if [[ "${query_status}" -ne 0 ]]; then
+            exit "${query_status}"
+          fi
+          exit "${render_status}"

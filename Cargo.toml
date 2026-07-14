@@ -1,0 +1,26 @@
+[package]
+name = "sdu-equery"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "scheduled-query"
+path = "src/bin/scheduled-query.rs"
+
+[dependencies]
+csv = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+chrono = "0.4"
+chrono-tz = "0.10"
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "rustls-tls", "smtp-transport"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true
