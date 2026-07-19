@@ -10,8 +10,11 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::time::sleep;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+
+const QUERY_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
 struct Config {
@@ -125,20 +128,46 @@ async fn query(config: &Config) -> Result<f64, QueryError> {
         .timeout(Duration::from_secs(25))
         .build()
         .map_err(|error| QueryError::InvalidResponse(error.to_string()))?;
-    let response = client
-        .post(QUERY_URL)
-        .header("Synjones-Auth", &config.auth)
-        .header("Accept", "application/json, text/plain, */*")
-        .form(&form)
-        .send()
-        .await
-        .map_err(|error| QueryError::InvalidResponse(error.to_string()))?;
-    let status = response.status().as_u16();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| QueryError::InvalidResponse(error.to_string()))?;
-    parse_query_response(status, &body)
+
+    for attempt in 1..=QUERY_MAX_ATTEMPTS {
+        let result = async {
+            let response = client
+                .post(QUERY_URL)
+                .header("Synjones-Auth", &config.auth)
+                .header("Accept", "application/json, text/plain, */*")
+                .form(&form)
+                .send()
+                .await?;
+            let status = response.status().as_u16();
+            let body = response.text().await?;
+            Ok::<_, reqwest::Error>((status, body))
+        }
+        .await;
+
+        match result {
+            Ok((status, _)) if should_retry_status(status) && attempt < QUERY_MAX_ATTEMPTS => {
+                eprintln!(
+                    "查询接口返回 HTTP {status}，准备进行第 {} 次尝试",
+                    attempt + 1
+                );
+            }
+            Ok((status, body)) => return parse_query_response(status, &body),
+            Err(error) if attempt < QUERY_MAX_ATTEMPTS => {
+                eprintln!(
+                    "查询请求失败（第 {attempt}/{QUERY_MAX_ATTEMPTS} 次）：{error}，即将重试"
+                );
+            }
+            Err(error) => return Err(QueryError::InvalidResponse(error.to_string())),
+        }
+
+        sleep(Duration::from_secs(1_u64 << attempt)).await;
+    }
+
+    unreachable!("查询重试循环至少执行一次")
+}
+
+fn should_retry_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
 }
 
 fn write_history(path: &Path, date: &str, electricity: f64) -> AppResult<()> {
@@ -242,4 +271,13 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        for status in [408, 425, 429, 500, 502, 599] {
+            assert!(should_retry_status(status));
+        }
+        for status in [200, 400, 401, 403, 404] {
+            assert!(!should_retry_status(status));
+        }
+    }
 }
